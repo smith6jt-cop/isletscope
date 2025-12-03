@@ -111,11 +111,52 @@ class CellSegmenter:
             self.device = device
             model.to(device)
 
+    def detect_tissue(self, image: np.ndarray, method: str = "otsu") -> np.ndarray:
+        """Detect tissue regions vs. background/glass.
+
+        This creates a binary mask separating tissue from background before
+        cell segmentation to prevent false positives on glass/empty regions.
+
+        Args:
+            image: RGB image (H, W, 3).
+            method: Detection method - 'otsu' (default), 'brightness', or 'saturation'.
+
+        Returns:
+            Binary tissue mask (H, W) where 1=tissue, 0=background.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        if method == "otsu":
+            # Otsu thresholding on inverted grayscale (tissue is darker than glass)
+            _, tissue_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        elif method == "brightness":
+            # Simple brightness threshold (glass/background is very bright)
+            tissue_mask = (gray < 220).astype(np.uint8) * 255
+
+        elif method == "saturation":
+            # Use saturation (tissue has color, glass is white/gray)
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            saturation = hsv[:, :, 1]
+            _, tissue_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'otsu', 'brightness', or 'saturation'")
+
+        # Morphological cleanup: remove small holes and debris
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        tissue_mask = cv2.morphologyEx(tissue_mask, cv2.MORPH_CLOSE, kernel)  # Fill holes
+        tissue_mask = cv2.morphologyEx(tissue_mask, cv2.MORPH_OPEN, kernel)   # Remove debris
+
+        return (tissue_mask > 0).astype(np.uint8)
+
     def segment(
         self,
         image: np.ndarray,
         image_type: str = "brightfield",
         channels: Optional[Sequence[int]] = None,
+        tissue_mask: Optional[np.ndarray] = None,
+        detect_tissue_first: bool = True,
     ) -> Dict[str, np.ndarray]:
         """Segment cells in an image.
 
@@ -126,21 +167,53 @@ class CellSegmenter:
                 preprocessing.
             channels: Optional channel indices to select (e.g. ``[0, 1, 2]``
                 for RGB or ``[2]`` for a particular fluorescent channel).
+            tissue_mask: Optional pre-computed tissue mask (H, W). If None and
+                detect_tissue_first=True, will auto-detect tissue.
+            detect_tissue_first: If True, detect tissue before segmenting cells.
+                Prevents false positives on background/glass.
 
         Returns:
-            Dictionary with keys ``'mask'`` and ``'labels'``.
+            Dictionary with keys ``'mask'``, ``'labels'``, and ``'tissue_mask'``.
         """
+        # Detect tissue boundaries first if requested
+        if detect_tissue_first and tissue_mask is None:
+            print("Detecting tissue boundaries...")
+            tissue_mask = self.detect_tissue(image, method="otsu")
+            tissue_area_pct = 100 * tissue_mask.sum() / tissue_mask.size
+            print(f"  Tissue area: {tissue_area_pct:.1f}% of image")
+
         image = self._select_channels(image, channels)
         backend = self._resolve_backend()
+
+        # Segment cells
         if backend == "model":
-            return self._segment_with_model(image)
-        if backend == "instanseg":
+            result = self._segment_with_model(image)
+        elif backend == "instanseg":
             try:
-                return self._segment_with_instanseg(image)
+                result = self._segment_with_instanseg(image)
             except Exception:
                 # Fall back gracefully to classical if InstanSeg cannot run.
-                return self._segment_classical(image, image_type=image_type)
-        return self._segment_classical(image, image_type=image_type)
+                result = self._segment_classical(image, image_type=image_type)
+        else:
+            result = self._segment_classical(image, image_type=image_type)
+
+        # Apply tissue mask to remove cells detected in background
+        if tissue_mask is not None:
+            original_cells = len(np.unique(result['labels'])) - 1
+            result['labels'] = result['labels'] * tissue_mask
+            result['mask'] = result['mask'] * tissue_mask
+
+            # Re-label to remove gaps
+            _, result['labels'] = cv2.connectedComponents(result['mask'], connectivity=8)
+            final_cells = len(np.unique(result['labels'])) - 1
+
+            if original_cells > 0:
+                removed_pct = 100 * (original_cells - final_cells) / original_cells
+                print(f"  Removed {original_cells - final_cells:,} cells in background ({removed_pct:.1f}%)")
+            print(f"  Final cell count: {final_cells:,} cells in tissue")
+
+        result['tissue_mask'] = tissue_mask
+        return result
 
     def detect_markers(
         self,

@@ -1,0 +1,22 @@
+name: isletscope
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - opencv
+  - matplotlib
+  - nbformat
+  - sphinx
+  - openslide
+  - openslide-python
+  - pip
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.4  # Adjust version depending on your GPU driver; 12.4 supports Blackwell and Ada architectures
+  - pip:
+      - instanseg-torch[full]  # Includes InstanSeg models and training utilities
+      - cellpose  # Optional: alternative cell segmentation model

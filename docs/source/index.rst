@@ -10,6 +10,11 @@ IsletScope is a modular framework for pancreatic histology analysis.  It provide
    :align: center
    :alt: IsletScope logo
 
+Environment
+-----------
+
+Create the environment directly from the YAML that matches your hardware.  Use ``environment.yml`` for GPU systems (Blackwell B200, RTX 6000 Ada) and ``environment.cpu.yml`` for CPU-only setups.  Activate with ``mamba activate isletscope`` (or ``isletscope-cpu``) and install the package editable via ``pip install -e .``.  CuPy is optional; if it is available on your channels and you want GPU-accelerated stain normalization, install it with ``mamba install -n isletscope cupy-cuda12x`` after creating the environment.
+
 Contents
 --------
 

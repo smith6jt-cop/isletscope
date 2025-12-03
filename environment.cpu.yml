@@ -1,0 +1,19 @@
+name: isletscope-cpu
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - opencv
+  - matplotlib
+  - nbformat
+  - sphinx
+  - openslide
+  - openslide-python
+  - pip
+  - pytorch
+  - torchvision
+  - pip:
+      - instanseg-torch[full]  # installs but will run CPU-only if CUDA is unavailable
+      - cellpose  # optional: alternative cell segmentation model

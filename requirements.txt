@@ -1,6 +1,0 @@
-numpy
-opencv-python
-matplotlib
-torch; extra == "all"
-nbformat
-sphinx

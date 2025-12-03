@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isletscope"
+version = "0.1.0"
+description = "Pancreatic histology analysis toolkit (stain normalization, segmentation, islet detection, radial analysis, tissue classification, 3D inference)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "IsletScope Team" }]
+dependencies = [
+    "numpy>=1.23",
+    "opencv-python-headless>=4.8",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+docs = ["sphinx>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["isletscope"]

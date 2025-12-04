@@ -8,6 +8,14 @@ algorithm applies an adaptive threshold to grayscale images, removes
 artifacts and produces a binary mask of putative cells.  Fluorescent images
 are handled by channel selection and percentile thresholding.
 
+For brightfield H&E images, the enhanced nuclear segmentation module provides
+superior results through:
+- True hematoxylin channel extraction (not just normalization)
+- CLAHE contrast enhancement
+- Watershed-based segmentation with distance markers
+
+See also: :mod:`isletscope.nuclear_segmentation`
+
 The segmentation output is a dictionary containing:
 
 * ``mask`` – a binary mask of the same height and width as the input image
@@ -34,6 +42,16 @@ except ImportError:
 
 _INSTANSEG_AVAILABLE = importlib.util.find_spec("instanseg") is not None
 
+# Check if enhanced nuclear segmentation is available
+try:
+    from isletscope.nuclear_segmentation import (
+        EnhancedNuclearSegmenter,
+        NuclearPreprocessor,
+    )
+    _NUCLEAR_SEGMENTATION_AVAILABLE = True
+except ImportError:
+    _NUCLEAR_SEGMENTATION_AVAILABLE = False
+
 
 class CellSegmenter:
     """Segment cells in brightfield or fluorescent images.
@@ -43,6 +61,19 @@ class CellSegmenter:
     method that adapts to brightfield or fluorescent inputs.  InstanSeg
     is auto‑detected when installed, but any callable PyTorch model can be
     supplied.
+
+    For brightfield H&E images, enhanced nuclear segmentation backends provide
+    superior results:
+
+    - ``'hematoxylin_watershed'``: Hematoxylin extraction + CLAHE + watershed
+      (recommended for most brightfield H&E images)
+    - ``'hematoxylin_instanseg'``: Hematoxylin extraction + CLAHE + InstanSeg
+      (best quality when InstanSeg is available)
+    - ``'hematoxylin_adaptive'``: Hematoxylin extraction + adaptive threshold
+      (fastest, good for well-stained samples)
+
+    These backends use true color deconvolution to extract the hematoxylin
+    channel (nuclear signal) rather than just normalizing colors.
     """
 
     def __init__(
@@ -62,6 +93,11 @@ class CellSegmenter:
         pixel_size: Optional[float] = None,
         normalization: bool = True,
         image_reader: str = "tiffslide",
+        # Enhanced nuclear segmentation parameters
+        stain_matrix: str = "he_standard",
+        clahe_clip_limit: float = 3.0,
+        min_distance: int = 10,
+        max_size: int = 5000,
     ) -> None:
         """Initialize the segmenter.
 
@@ -70,8 +106,15 @@ class CellSegmenter:
                 ``model.predict(image: np.ndarray) -> np.ndarray`` or
                 a PyTorch ``nn.Module``.
             device: Optional device string for PyTorch models (e.g. ``'cuda'``).
-            backend: ``'auto'`` (default), ``'instanseg'``, ``'model'`` or
-                ``'classical'``.
+            backend: Segmentation backend to use. Options:
+                - ``'auto'`` (default): Auto-select based on availability
+                - ``'instanseg'``: Standard InstanSeg on RGB image
+                - ``'model'``: Use provided custom model
+                - ``'classical'``: Simple thresholding + morphology
+                - ``'hematoxylin_watershed'``: Hematoxylin extraction + watershed
+                  (recommended for brightfield H&E)
+                - ``'hematoxylin_instanseg'``: Hematoxylin extraction + InstanSeg
+                - ``'hematoxylin_adaptive'``: Hematoxylin extraction + adaptive threshold
             use_instanseg: If ``True``, attempt to run InstanSeg when installed
                 and no custom model is provided.
             probability_threshold: Threshold applied to model outputs to derive
@@ -86,6 +129,11 @@ class CellSegmenter:
             pixel_size: Physical pixel size in microns (auto-detected from metadata if None).
             normalization: Apply intensity normalization before segmentation.
             image_reader: Image reading backend (``'tiffslide'``, ``'openslide'``, etc.).
+            stain_matrix: Stain matrix for hematoxylin extraction. Options:
+                ``'he_standard'``, ``'he_ruifrok'``, ``'dab'``.
+            clahe_clip_limit: CLAHE clip limit for contrast enhancement (higher = more contrast).
+            min_distance: Minimum distance between nuclei for watershed segmentation.
+            max_size: Maximum nucleus size in pixels (larger objects filtered out).
         """
         self.model = model
         self.device = device
@@ -104,6 +152,13 @@ class CellSegmenter:
         self.normalization = normalization
         self.image_reader = image_reader
         self._instanseg_model = None  # Lazy initialization
+
+        # Enhanced nuclear segmentation parameters
+        self.stain_matrix = stain_matrix
+        self.clahe_clip_limit = clahe_clip_limit
+        self.min_distance = min_distance
+        self.max_size = max_size
+        self._enhanced_segmenter = None  # Lazy initialization
 
         if model is not None and _TORCH_AVAILABLE and hasattr(model, "to"):
             if device is None:
@@ -185,8 +240,23 @@ class CellSegmenter:
         image = self._select_channels(image, channels)
         backend = self._resolve_backend()
 
-        # Segment cells
-        if backend == "model":
+        # Segment cells using the appropriate backend
+        if self._is_hematoxylin_backend(backend):
+            # Use enhanced nuclear segmentation for hematoxylin-based backends
+            try:
+                enhanced_segmenter = self._get_enhanced_segmenter(backend)
+                print(f"Using enhanced nuclear segmentation: {backend}")
+                result = enhanced_segmenter.segment(
+                    image,
+                    tissue_mask=tissue_mask,
+                    detect_tissue_first=False,  # We already handled tissue detection
+                )
+                # Tissue mask already applied by enhanced segmenter
+                tissue_mask = result.get('tissue_mask')
+            except Exception as e:
+                print(f"Warning: Enhanced segmentation failed ({e}), falling back to classical")
+                result = self._segment_classical(image, image_type=image_type)
+        elif backend == "model":
             result = self._segment_with_model(image)
         elif backend == "instanseg":
             try:
@@ -198,7 +268,8 @@ class CellSegmenter:
             result = self._segment_classical(image, image_type=image_type)
 
         # Apply tissue mask to remove cells detected in background
-        if tissue_mask is not None:
+        # (skip for hematoxylin backends which already apply the mask)
+        if tissue_mask is not None and not self._is_hematoxylin_backend(backend):
             original_cells = len(np.unique(result['labels'])) - 1
             result['labels'] = result['labels'] * tissue_mask
             result['mask'] = result['mask'] * tissue_mask
@@ -211,6 +282,10 @@ class CellSegmenter:
                 removed_pct = 100 * (original_cells - final_cells) / original_cells
                 print(f"  Removed {original_cells - final_cells:,} cells in background ({removed_pct:.1f}%)")
             print(f"  Final cell count: {final_cells:,} cells in tissue")
+        else:
+            # Report final count for hematoxylin backends
+            final_cells = len(np.unique(result['labels'])) - 1
+            print(f"  Final cell count: {final_cells:,} cells")
 
         result['tissue_mask'] = tissue_mask
         return result
@@ -261,13 +336,56 @@ class CellSegmenter:
     # Internal helpers -----------------------------------------------------
 
     def _resolve_backend(self) -> str:
+        """Resolve the backend to use based on settings and availability."""
         if self.backend != "auto":
             return self.backend
         if self.model is not None:
             return "model"
+        # For auto mode, prefer enhanced hematoxylin-based segmentation
+        # if available, as it provides better results for brightfield H&E
+        if _NUCLEAR_SEGMENTATION_AVAILABLE:
+            return "hematoxylin_watershed"
         if self.use_instanseg and _INSTANSEG_AVAILABLE:
             return "instanseg"
         return "classical"
+
+    def _is_hematoxylin_backend(self, backend: str) -> bool:
+        """Check if backend uses enhanced hematoxylin processing."""
+        return backend in (
+            "hematoxylin_watershed",
+            "hematoxylin_instanseg",
+            "hematoxylin_adaptive",
+        )
+
+    def _get_enhanced_segmenter(self, backend: str) -> "EnhancedNuclearSegmenter":
+        """Get or create the enhanced nuclear segmenter."""
+        if not _NUCLEAR_SEGMENTATION_AVAILABLE:
+            raise ImportError(
+                "Enhanced nuclear segmentation requires scipy and scikit-image. "
+                "Install with: pip install scipy scikit-image"
+            )
+
+        # Map backend names to EnhancedNuclearSegmenter backend names
+        backend_map = {
+            "hematoxylin_watershed": "watershed",
+            "hematoxylin_instanseg": "instanseg_hematoxylin",
+            "hematoxylin_adaptive": "adaptive_threshold",
+        }
+
+        if self._enhanced_segmenter is None or self._enhanced_segmenter.backend != backend_map.get(backend):
+            self._enhanced_segmenter = EnhancedNuclearSegmenter(
+                backend=backend_map.get(backend, "watershed"),
+                stain_matrix=self.stain_matrix,
+                clahe_clip_limit=self.clahe_clip_limit,
+                instanseg_model_name=self.instanseg_model_name,
+                tile_size=self.tile_size,
+                tile_overlap=self.tile_overlap,
+                min_distance=self.min_distance,
+                min_size=self.min_size,
+                max_size=self.max_size,
+            )
+
+        return self._enhanced_segmenter
 
     def _select_channels(self, image: np.ndarray, channels: Optional[Sequence[int]]) -> np.ndarray:
         if channels is None or image.ndim == 2:
